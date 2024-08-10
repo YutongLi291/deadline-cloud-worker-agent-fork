@@ -3,6 +3,7 @@
 This test module contains tests that verify the Worker agent's behavior by submitting jobs to the
 Deadline Cloud service and checking that the result/output of the jobs is as we expect it.
 """
+import json
 from typing import Any, Dict, List, Optional
 import pytest
 import logging
@@ -440,10 +441,21 @@ class TestJobSubmission:
 
         assert len(worker_logs["events"]) > 0
 
+    @pytest.mark.parametrize(
+        "append_string_script",
+        [
+            (
+                "#!/usr/bin/env bash\n\n  echo -n $(cat {{Param.DataDir}}/files/test_input_file){{Param.StringToAppend}} > {{Param.DataDir}}/output_file.txt\n"
+                if get_operating_system_name() == "linux"
+                else 'set /p input=<"{{Param.DataDir}}\\files\\test_input_file"\n echo|set /p="%%input%%{{Param.StringToAppend}}">{{Param.DataDir}}\\output_file.txt'
+            )
+        ],
+    )
     def test_worker_uses_job_attachment_configuration(
         self,
         deadline_resources: DeadlineResources,
         deadline_client: DeadlineClient,
+        append_string_script: str,
     ) -> None:
         # Verify that the worker uses the correct job attachment configuration, and writes the output to the correct location
 
@@ -457,19 +469,63 @@ class TestJobSubmission:
             {"name": "StringToAppend", "value": test_run_uuid},
             {"name": "DataDir", "value": job_bundle_path},
         ]
-        config = configparser.ConfigParser()
+        try:
+            with open(os.path.join(job_bundle_path, "template.json"), "w+") as template_file:
+                template_file.write(
+                    json.dumps(
+                        {
+                            "specificationVersion": "jobtemplate-2023-09",
+                            "name": "AssetsExample",
+                            "parameterDefinitions": [
+                                {
+                                    "name": "DataDir",
+                                    "type": "PATH",
+                                    "dataFlow": "INOUT",
+                                    "userInterface": {
+                                        "label": "Input/Output Directory",
+                                        "control": "CHOOSE_DIRECTORY",
+                                    },
+                                },
+                                {"name": "StringToAppend", "type": "STRING"},
+                            ],
+                            "steps": [
+                                {
+                                    "name": "AppendString",
+                                    "script": {
+                                        "actions": {
+                                            "onRun": {"command": "{{ Task.File.runScript }}"}
+                                        },
+                                        "embeddedFiles": [
+                                            {
+                                                "name": "runScript",
+                                                "type": "TEXT",
+                                                "runnable": True,
+                                                "data": append_string_script,
+                                            }
+                                        ],
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                )
 
-        set_setting("defaults.farm_id", deadline_resources.farm.id, config)
-        set_setting("defaults.queue_id", deadline_resources.queue_a.id, config)
+            config = configparser.ConfigParser()
 
-        job_id: Optional[str] = api.create_job_from_job_bundle(
-            job_bundle_path,
-            job_parameters,
-            priority=99,
-            config=config,
-            queue_parameter_definitions=[],
-        )
-        assert job_id is not None
+            set_setting("defaults.farm_id", deadline_resources.farm.id, config)
+            set_setting("defaults.queue_id", deadline_resources.queue_a.id, config)
+
+            job_id: Optional[str] = api.create_job_from_job_bundle(
+                job_bundle_path,
+                job_parameters,
+                priority=99,
+                config=config,
+                queue_parameter_definitions=[],
+            )
+            assert job_id is not None
+        finally:
+            # Clean up the template file
+            os.remove(os.path.join(job_bundle_path, "template.json"))
 
         job_details = Job.get_job_details(
             client=deadline_client,
@@ -517,5 +573,6 @@ class TestJobSubmission:
             ):
                 input_file_content: str = input_file.read()
                 output_file_content = output_file.read()
+
                 # Verify that the output file content is the input file content plus the uuid we appended in the job
                 assert output_file_content == (input_file_content + test_run_uuid)
